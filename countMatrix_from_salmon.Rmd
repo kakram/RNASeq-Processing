@@ -1,0 +1,102 @@
+---
+title: "Count Matrix Generation from Salmon Results"
+output: html_document
+date: "2025-04-09"
+---
+
+# Setup and load libraries
+```{r setup, include=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tximport)
+library(readr)
+library(stringr)
+library(rtracklayer)
+library(GenomicFeatures)
+```
+
+# Define sample paths and Mmetadata
+```{r define-files}
+# Sample folder names 
+samples <- c("WTBPA", "WTBPF", "B4UN", "B4BPA", "B4BPF")
+
+# Path to quant.sf files
+files <- file.path("Transcript_Quantification", samples, "quant.sf")
+names(files) <- samples
+
+print(files)
+```
+
+# Create transcript-to-gene mapping from GTF
+```{r tx2gene-gtf}
+gtf <- import("../salmon_ref/gencode.v44.annotation.gtf")
+txdf <- gtf[gtf$type == "transcript"]
+
+tx2gene <- data.frame(
+  transcript_id = txdf$transcript_id,
+  gene_id = txdf$gene_id
+)
+
+# Remove duplicates (important)
+tx2gene <- unique(tx2gene)
+
+head(tx2gene)
+```
+
+# Run tximport to combine gene-level counts
+```{r run-tximport}
+txi <- tximport(files, type = "salmon", tx2gene = tx2gene, ignoreAfterBar = TRUE, countsFromAbundance = "lengthScaledTPM")
+
+head(txi$counts)
+dim(txi$counts)
+head(txi$abundance)
+head(txi$length)
+```
+
+# Convert txi$counts to its own data frame (transcript level count estimations)
+```{r convert-df}
+# Extract and convert to data frame
+count_df <- as.data.frame(txi$counts)
+
+# Add gene IDs as a column instead of rownames
+count_df$gene_id <- rownames(count_df)
+
+head(count_df)
+```
+
+# Annotate gene IDs using gprofiler2
+```{r ann-gene-id}
+library(gprofiler2)
+
+# Prepare gene IDs
+gene_ids <- gsub("\\..*", "", count_df$gene_id)
+
+# Query g:Convert from g:Profiler
+annotation <- gconvert(
+  query = gene_ids,
+  organism = "hsapiens",
+  target = "ENSG", 
+  mthreshold = Inf
+)
+
+# Select only gene ID, name, and description
+ann_subset <- annotation[, c("input", "name", "description")]
+
+# Merge back into your count data
+count_df$gene_id_clean <- gsub("\\..*", "", count_df$gene_id)  # remove version
+final_df <- merge(count_df, ann_subset, by.x = "gene_id_clean", by.y = "input", all.x = TRUE)
+
+# Reorder columns
+final_df <- final_df[, c("gene_id", "name", "description", setdiff(colnames(final_df), c("gene_id", "name", "description", "gene_id_clean")))]
+
+final_df
+```
+
+# Write csv of count matrix results
+```{r write-csv}
+write.csv(final_df, "annotated_tmm_normalized_counts.csv", row.names = FALSE)
+```
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,406 @@
+---
+title: "RNAseq Analysis"
+output: html_document
+date: "2025-04-09"
+---
+
+# Setup and load libraries
+```{r setup, include=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(tximport)
+library(DESeq2)
+library(ggplot2)
+library(pheatmap)
+library(ComplexHeatmap)
+library(EnhancedVolcano)
+library(RColorBrewer)
+library(dplyr)
+library(tibble)
+library(ggrepel)
+library(gplots)
+library(reshape2)
+library(RNAseqQC)
+library(purrr)
+library(tidyr)
+library(magrittr)
+library(circlize)
+```
+
+# Load and format data
+```{r load-data}
+# txi$counts should contain gene-level data
+counts <- read.csv("annotated_tmm_normalized_counts.csv")
+
+counts <- counts[!duplicated(counts$name), ] # Remove duplicate gene name rows
+counts <- na.omit(counts) # Remove NA/missing values
+rownames(counts) <- counts$name # Set rownames
+counts <- counts[ , -(1:3)] # Remove first 3 columns
+counts <- round(counts) # DESeq2 expects integer counts
+
+# Filter counts df
+counts <- counts[rowSums(counts) >= 10, ]
+
+# Sample metadata
+sample_table <- data.frame(
+  sampleName = colnames(counts),
+  knockout_status = c("WT", "WT", "ZFP36L1 -/-", "ZFP36L1 -/-", "ZFP36L1 -/-"),
+  bisphenol = c("BPA", "BPF", "Untreated", "BPA", "BPF")
+)
+
+rownames(sample_table) <- sample_table$sampleName
+```
+
+# Boxplot of raw counts
+```{r boxplot-tmm}
+# Log transform for visualization
+log_counts <- log2(counts + 1)
+
+# Boxplot
+boxplot(log_counts, las = 2, col = "white", main = "Boxplot of TMM Counts (log2)")
+```
+
+# Create DESeq object
+```{r dds-setup}
+dds <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData = sample_table,
+  design = ~ knockout_status + bisphenol
+)
+
+# Prefilter low counts
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep, ]
+
+dds
+```
+
+# QC plots on DESeq object
+```{r qc-plots}
+# Library complexity
+plot_library_complexity(dds)
+
+# Gene detection
+plot_gene_detection(dds)
+```
+
+# Variance stabilizations
+```{r var-stab}
+vsd <- vst(dds)
+mean_sd_plot(vsd)
+```
+
+# Replicate/sample variability
+```{r rep-var}
+# define new grouping variable
+colData(vsd)$trt_data <- paste0(colData(vsd)$bisphenol, "_", colData(vsd)$kockout_status)
+
+ma_plots <- plot_sample_MAs(vsd, group = "trt_data")
+cowplot::plot_grid(plotlist = ma_plots[17:24], ncol = 2)
+```
+
+# Sample clustering
+```{r sample-clust}
+# set seed to control random annotation colors
+set.seed(123)
+plot_sample_clustering(vsd, anno_vars = c("bisphenol", "knockout_status"), distance = "euclidean")
+```
+
+# Principal component analysis (PCA)
+```{r pca}
+plot_pca(vsd, PC_x = 1, PC_y = 2, color_by = "knockout_status", shape_by = "bisphenol")
+```
+
+# PCA loadings
+```{r pca-loadings}
+pca_res <- plot_pca(vsd, show_plot = FALSE)
+plot_loadings(pca_res, PC = 1, annotate_top_n = 5)
+```
+
+# Investigate multiple PCAs
+```{r investigate-pca}
+plot_pca_scatters(vsd, n_PCs = 4, color_by = "knockout_status", shape_by = "bisphenol", show_var_exp = FALSE)
+```
+
+# Differential testing
+```{r diff-test}
+# design variables need to be factors
+dds$knockout_status <- as.factor(dds$knockout_status)
+dds$bisphenol <- as.factor(dds$bisphenol)
+design(dds) <- ~ knockout_status + bisphenol
+
+dds <- DESeq(dds, parallel = T)
+plotDispEsts(dds, legend = FALSE) # black = gene-est, red = fitted, blue = final
+```
+
+# Write CSV file of differential testing results
+```{r save-de-res}
+# KO vs WT
+# log2FoldChange > 0 means gene is higher in KO than WT
+# log2FoldChange < 0 means gene is lower in KO than WT
+res_ko_vs_wt <- results(dds, contrast = c("knockout_status", "ZFP36L1 -/-", "WT"))
+res_ko_vs_wt$gene <- rownames(res_ko_vs_wt)
+write.csv(as.data.frame(res_ko_vs_wt), file = "DEA_ZFP36L1ko_vs_WT.csv", row.names = FALSE)
+
+# BPA vs Untreated
+# log2FoldChange > 0 means gene is higher in BPA than UN
+# log2FoldChange < 0 means gene is lower in BPA than UN
+res_bpa_vs_ctrl <- results(dds, contrast = c("bisphenol", "BPA", "Untreated"))
+res_bpa_vs_ctrl$gene <- rownames(res_bpa_vs_ctrl)
+write.csv(as.data.frame(res_bpa_vs_ctrl), file = "DEA_BPA_vs_Untreated.csv", row.names = FALSE)
+
+# BPF vs Untreated
+# log2FoldChange > 0 means gene is higher in BPF than UN
+# log2FoldChange < 0 means gene is lower in BPF than UN
+res_bpf_vs_ctrl <- results(dds, contrast = c("bisphenol", "BPF", "Untreated"))
+res_bpf_vs_ctrl$gene <- rownames(res_bpf_vs_ctrl)
+write.csv(as.data.frame(res_bpf_vs_ctrl), file = "DEA_BPF_vs_Untreated.csv", row.names = FALSE)
+
+# BPA vs BPF
+# log2FoldChange > 0 means gene is higher in BPA than BPF
+# log2FoldChange < 0 means gene is lower in BPA than BPF
+res_bpa_vs_bpf <- results(dds, contrast = c("bisphenol", "BPA", "BPF"))
+res_bpa_vs_bpf$gene <- rownames(res_bpa_vs_bpf)
+write.csv(as.data.frame(res_bpa_vs_bpf), file = "DEA_BPA_vs_BPF.csv", row.names = FALSE)
+
+# Could not run comparison between bisphenol treatment across conditions. This comparison caused issues as there is a high amount of collinearity and linear relationship between treatment when considering knockout status. This basically means that knockout status is what is driving any sort of difference and the bisphenols are having little to no impact on the gene expression. This can be seen in the PCA as well.
+```
+
+# Volcano plots
+```{r volcano-plots}
+EnhancedVolcano(res_ko_vs_wt,
+    lab = res_ko_vs_wt$gene,
+    x = 'log2FoldChange',
+    y = 'padj',
+    title = 'KO vs WT',
+    pCutoff = 0.05,
+    FCcutoff = 1,
+    pointSize = 2.5,
+    labSize = 3.5,
+    max.overlaps = 10,
+    legendPosition = 'right'
+)
+
+EnhancedVolcano(res_bpa_vs_ctrl,
+    lab = res_bpa_vs_ctrl$gene,
+    x = 'log2FoldChange',
+    y = 'padj',
+    title = 'BPA vs Untreated',
+    pCutoff = 0.05,
+    FCcutoff = 1,
+    pointSize = 2.5,
+    labSize = 3.5,
+    max.overlaps = 10
+)
+
+EnhancedVolcano(res_bpf_vs_ctrl,
+    lab = res_bpf_vs_ctrl$gene,
+    x = 'log2FoldChange',
+    y = 'padj',
+    title = 'BPF vs Untreated',
+    pCutoff = 0.05,
+    FCcutoff = 1,
+    pointSize = 2.5,
+    labSize = 3.5
+)
+
+EnhancedVolcano(res_bpa_vs_bpf,
+    lab = res_bpa_vs_bpf$gene,
+    x = 'log2FoldChange',
+    y = 'padj',
+    title = 'BPA vs BPF',
+    pCutoff = 0.05,
+    FCcutoff = 1,
+    pointSize = 2.5,
+    labSize = 3.5
+)
+```
+
+# Heatmap
+```{r heatmap}
+vsd <- vst(dds, blind = FALSE)  # or use rlog(dds, blind = FALSE)
+vst_mat <- assay(vsd)  # This contains all genes × samples
+
+vst_scaled <- t(scale(t(vst_mat)))  # Z-score normalization per gene
+
+# Create annotation from metadata
+metadata <- as.data.frame(colData(vsd)[, c("knockout_status", "bisphenol")])
+
+# Define annotation colors
+ann_colors <- list(
+  knockout_status = c("WT" = "#1f77b4", "ZFP36L1 -/-" = "#d62728"),
+  bisphenol = c("BPA" = "#ff7f0e", "BPF" = "#2ca02c", "Untreated" = "#9467bd")
+)
+
+# Create ComplexHeatmap annotation
+column_ha <- HeatmapAnnotation(
+  df = metadata,
+  col = ann_colors,
+  show_annotation_name = TRUE
+)
+
+Heatmap(
+  vst_scaled,  # or vst_mat if not scaled
+  name = "Z-score",
+  top_annotation = column_ha,
+  show_row_names = FALSE,       # Hide row names for readability
+  show_column_names = TRUE,
+  cluster_columns = TRUE,
+  cluster_rows = TRUE,
+  col = colorRamp2(c(-2, 0, 2), c("blue", "white", "red")),
+  column_title = "Heatmap of All Genes",
+  row_names_gp = gpar(fontsize = 6),
+  column_names_gp = gpar(fontsize = 10)
+)
+```
+
+# Functional enrichment analysis
+## Prepare gene list
+```{r prep-gene-list}
+# Ensure the results are ordered by adjusted p-value
+res_ko_vs_wt <- res_ko_vs_wt[order(res_ko_vs_wt$padj), ]
+
+# Extract the gene symbols and log2 fold changes
+gene_list <- res_ko_vs_wt$log2FoldChange
+names(gene_list) <- res_ko_vs_wt$gene
+
+# Remove NA values
+gene_list <- na.omit(gene_list)
+
+# Sort the gene list in decreasing order (required for GSEA)
+gene_list <- sort(gene_list, decreasing = TRUE)
+```
+
+## Perform gene ontology (GO) enrichment analysis
+```{r go-enr}
+# Define the universe of genes (all genes tested)
+universe_genes <- rownames(res_ko_vs_wt)
+
+# Perform ORA for Biological Process (BP)
+ego_bp <- enrichGO(
+  gene          = names(gene_list),
+  universe      = universe_genes,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+# Perform ORA for Molecular Function (MF)
+ego_mf <- enrichGO(
+  gene          = names(gene_list),
+  universe      = universe_genes,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "MF",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+
+# Perform ORA for Cellular Component (CC)
+ego_cc <- enrichGO(
+  gene          = names(gene_list),
+  universe      = universe_genes,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "CC",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05
+)
+```
+
+## Gene set enrichment analysis (GSEA)
+```{r gsea}
+# GSEA for Biological Process (BP)
+gsea_bp <- gseGO(
+  geneList      = gene_list,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  verbose       = FALSE
+)
+
+# GSEA for Molecular Function (MF)
+gsea_mf <- gseGO(
+  geneList      = gene_list,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "MF",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  verbose       = FALSE
+)
+
+# GSEA for Cellular Component (CC)
+gsea_cc <- gseGO(
+  geneList      = gene_list,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "CC",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  verbose       = FALSE
+)
+```
+
+## KEGG Over-Representation Analysis (ORA)
+```{r kegg-ora}
+# Convert gene symbols to Entrez IDs
+gene_symbols <- names(gene_list)
+entrez_ids <- mapIds(org.Hs.eg.db, keys = gene_symbols, column = "ENTREZID", keytype = "SYMBOL", multiVals = "first")
+entrez_ids <- na.omit(entrez_ids)
+
+# Perform KEGG ORA
+kegg_ora <- enrichKEGG(
+  gene          = entrez_ids,
+  organism      = 'hsa',
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05
+)
+```
+
+## KEGG GSEA
+```{r kegg-gsea}
+# Prepare the ranked list with Entrez IDs
+gene_list_entrez <- gene_list[names(entrez_ids)]
+names(gene_list_entrez) <- entrez_ids
+
+# Perform KEGG GSEA
+kegg_gsea <- gseKEGG(
+  geneList      = gene_list_entrez,
+  organism      = 'hsa',
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  verbose       = FALSE
+)
+```
+
+## Visualize functional enrichment analysis results
+```{r viz-enr-res}
+# Dotplots of GO GSEA results
+dotplot(gsea_mf, showCategory = 10, title = "GO MF GSEA", font.size = 12)
+dotplot(gsea_cc, showCategory = 10, title = "GO CC GSEA", font.size = 12)
+
+# KEGG ORA dotplot
+dotplot(kegg_ora, showCategory = 10, title = "KEGG Pathway ORA", font.size = 12)
+
+# KEGG GSEA enrichment map and dotplot
+dotplot(kegg_gsea, showCategory = 10, title = "KEGG Pathway GSEA", font.size = 12)
+
+# GSEA plot for a specific KEGG term
+gseaplot2(kegg_gsea, geneSetID = kegg_gsea$ID[1], title = kegg_gsea$Description[1])
+gseaplot2(kegg_gsea, geneSetID = kegg_gsea$ID[2], title = kegg_gsea$Description[2])
+```
+
+```{r}
+sessionInfo()
+```
